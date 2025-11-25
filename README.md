@@ -1,13 +1,13 @@
 <p align="left">
-  <img src="images/smoothify_logo.png" alt="Smoothify Text" width="600">
+  <img src="https://raw.githubusercontent.com/DPIRD-DMA/Smoothify/main/images/smoothify_logo.png" alt="Smoothify Text" width="600">
 </p>
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DPIRD-DMA/Smoothify/blob/main/LICENSE)
 [![PyPI version](https://img.shields.io/pypi/v/smoothify.svg)](https://pypi.org/project/smoothify/)
 [![Tutorials](https://img.shields.io/badge/Tutorials-Learn-brightgreen)](https://github.com/DPIRD-DMA/Smoothify/tree/main/examples)
 
-📋 [View Changelog](CHANGELOG.md)
+📋 [View Changelog](https://github.com/DPIRD-DMA/Smoothify/blob/main/CHANGELOG.md)
 
 A Python package for smoothing and refining geometries derived from raster data classifications. Smoothify transforms jagged polygons and lines resulting from raster-to-vector conversion into smooth, visually appealing features using an optimized implementation of Chaikin's corner-cutting algorithm.
 
@@ -29,7 +29,7 @@ Smoothify applies an optimized implementation of Chaikin's corner-cutting algori
 - Efficiently processing large datasets with multiprocessing
 
 <p align="left">
-  <img src="images/smoothify_hero.png" alt="Smoothify Hero Image" width="600">
+  <img src="https://raw.githubusercontent.com/DPIRD-DMA/Smoothify/main/images/smoothify_hero.png" alt="Smoothify Hero Image" width="600">
 </p>
 
 ## Installation
@@ -161,4 +161,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](https://github.com/DPIRD-DMA/Smoothify/blob/main/LICENSE) file for details.
