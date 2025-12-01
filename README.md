@@ -72,6 +72,12 @@ smoothed_gdf.to_file("smoothed_polygons.gpkg")
 
 ## Examples
 
+Example notebooks:
+- [Usage examples](https://github.com/DPIRD-DMA/Smoothify/blob/main/examples/usage_examples.ipynb)
+- [Smoothify vs. Shapely comparison](https://github.com/DPIRD-DMA/Smoothify/blob/main/examples/smoothify_vs_shapely_comparison.ipynb)
+- [Real-world water example](https://github.com/DPIRD-DMA/Smoothify/blob/main/examples/real_world_water_example.ipynb)
+
+
 ### Basic Polygon Smoothing
 
 Transform pixelated polygons from raster data into smooth, natural-looking features:
@@ -104,7 +110,6 @@ When processing multiple adjacent polygons, allowing merge_collection = True pro
   <img src="https://raw.githubusercontent.com/DPIRD-DMA/Smoothify/main/images/example_4_merging.png" alt="Merging Adjacent Geometries" width="700">
 </p>
 
-For more examples, see the [examples directory](https://github.com/DPIRD-DMA/Smoothify/tree/main/examples).
 
 ## General Usage
 
