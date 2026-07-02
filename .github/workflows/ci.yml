@@ -33,8 +33,11 @@ jobs:
         run: uv run mypy smoothify/
 
       - name: Test
-        run: uv run pytest tests/ -x -q
+        # -n 2 overrides the local `-n auto` default: GitHub runners have 4
+        # vCPUs and some tests spawn smoothify's own worker pool, so a smaller
+        # fan-out avoids oversubscribing the runner.
+        run: uv run pytest tests/ -n 2 -x -q
 
       - name: Notebook smoke test
         if: matrix.python-version == '3.11'
-        run: uv run pytest --nbmake examples/*.ipynb -q
+        run: uv run pytest --nbmake examples/*.ipynb -n 2 -q

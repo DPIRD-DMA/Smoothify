@@ -49,6 +49,7 @@ dev = [
     "pre-commit>=4.0",
     "pytest>=8.4.2",
     "pytest-cov>=6.0.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.12.2",
 ]
 

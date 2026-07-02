@@ -244,17 +244,17 @@ Smoothify uses [pytest](https://pytest.org/). After cloning the repository, inst
 # Install dependencies (including the dev group)
 uv sync
 
-# Run all tests
+# Run all tests (parallelised across CPU cores by default via pytest-xdist)
 uv run pytest tests/
 
 # Run with coverage
 uv run pytest tests/ --cov=smoothify --cov-report=html
 
-# Run a single test
-uv run pytest tests/test_chaikin.py::TestChaikinCornerCutting::test_simple_square_polygon
+# Run a single test (add `-n 0` to disable parallelism for clearer output)
+uv run pytest tests/test_chaikin.py::TestChaikinCornerCutting::test_simple_square_polygon -n 0
 ```
 
-If you prefer not to use uv, install the dev dependencies into your environment and run `pytest tests/` directly.
+The suite runs in parallel by default (`-n auto` in `pytest.ini`); pass `-n 0` to run serially when debugging. If you prefer not to use uv, install the dev dependencies into your environment and run `pytest tests/` directly.
 
 ## Contributing
 
