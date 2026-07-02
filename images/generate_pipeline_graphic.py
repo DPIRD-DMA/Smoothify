@@ -20,7 +20,9 @@ from shapely.ops import unary_union
 from smoothify.smoothify_core import (
     _CHAIKIN_SEGMENT_FACTOR,
     _chaikin_corner_cutting,
+    _combine_variants,
     _generate_starting_point_variants,
+    _polygonal_only,
     _preserve_area_with_buffer,
 )
 
@@ -51,7 +53,12 @@ def pixel_blob() -> Polygon:
     ]
     merged = unary_union(squares)
     assert isinstance(merged, Polygon)
-    return merged
+    # unary_union leaves a vertex at every pixel boundary along straight runs;
+    # drop the collinear ones (tolerance 0) so only the true staircase corners
+    # remain, matching what a polygonized raster's meaningful vertices are.
+    corners = merged.simplify(0)
+    assert isinstance(corners, Polygon)
+    return corners
 
 
 def draw(ax, geom, color="black", lw=1.8, dots=False, alpha=1.0, style="-"):
@@ -78,34 +85,35 @@ def main() -> None:
     original = pixel_blob()
 
     # --- the simplified pipeline, capturing intermediates -------------------
-    # 1. densify so the start-point rotation has vertices to rotate to
-    densified = original.segmentize(SEGMENT_LENGTH / 2)
-
-    # 2. rotated start-point variants, each simplified (noise removal) and
-    #    re-segmentized so corner rounding stays capped at segment_length
+    # 1. variants that start at evenly spaced arc-length positions, each
+    #    simplified (noise removal) and re-segmentized so corner rounding stays
+    #    capped at segment_length. No up-front densify is needed: the start
+    #    points are interpolated directly at their arc-length positions.
     variants = []
-    for variant in _generate_starting_point_variants(densified, n_starting_points=4):
+    for variant in _generate_starting_point_variants(original, n_starting_points=4):
         variant = variant.simplify(
             tolerance=SEGMENT_LENGTH, preserve_topology=True
         ).segmentize(SEGMENT_LENGTH * _CHAIKIN_SEGMENT_FACTOR)
         variants.append(variant)
 
-    # 3. Chaikin corner cutting per variant
+    # 2. Chaikin corner cutting per variant
     smoothed_variants = [
-        make_valid(_chaikin_corner_cutting(v, num_iterations=2)) for v in variants
+        _polygonal_only(make_valid(_chaikin_corner_cutting(v, num_iterations=2)))
+        for v in variants
     ]
 
-    # 4. union of the variants removes each one's start-point artifact
-    merged = make_valid(unary_union(smoothed_variants)).simplify(
+    # 3. per-point median merge: a start-invariant consensus of the variants
+    merged = _combine_variants(smoothed_variants).simplify(
         tolerance=SEGMENT_LENGTH / 5, preserve_topology=True
     )
+    assert isinstance(merged, Polygon)
 
-    # 5. final smoothing pass
+    # 4. final smoothing pass
     final_smooth = _chaikin_corner_cutting(
         merged.segmentize(SEGMENT_LENGTH * _CHAIKIN_SEGMENT_FACTOR), num_iterations=3
     )
 
-    # 6. restore the original area by buffering
+    # 5. restore the original area by buffering
     final = _preserve_area_with_buffer(
         final_smooth, target_area=original.area, tolerance=original.area * 1e-4
     )
@@ -121,32 +129,34 @@ def main() -> None:
 
     ax = panels[1]
     reference(ax, original)
-    draw(ax, densified, color="black", lw=1.0, dots=True)
-    ax.set_title("2. Densify\n(segmentize at segment_length / 2)")
+    for v, c, s in zip(variants, VARIANT_COLORS, VARIANT_STYLES, strict=True):
+        draw(ax, v, color=c, lw=1.6, alpha=0.9, style=s)
+    ax.set_title("2. Start at 4 arc-length\npositions, simplify each")
 
     ax = panels[2]
     reference(ax, original)
-    for v, c, s in zip(variants, VARIANT_COLORS, VARIANT_STYLES, strict=True):
+    for v, c, s in zip(smoothed_variants, VARIANT_COLORS, VARIANT_STYLES, strict=True):
         draw(ax, v, color=c, lw=1.6, alpha=0.9, style=s)
-    ax.set_title("3. Rotate start point 4 ways,\nsimplify each variant")
+    ax.set_title("3. Chaikin corner cutting\nper variant")
 
     ax = panels[3]
     reference(ax, original)
     for v, c, s in zip(smoothed_variants, VARIANT_COLORS, VARIANT_STYLES, strict=True):
-        draw(ax, v, color=c, lw=1.6, alpha=0.9, style=s)
-    ax.set_title("4. Chaikin corner cutting\nper variant")
+        draw(ax, v, color=c, lw=1.0, alpha=0.35, style=s)
+    draw(ax, merged, color="black", lw=2.0)
+    ax.set_title("4. Per-point median merge\n(start-invariant consensus)")
 
     ax = panels[4]
     reference(ax, original)
-    draw(ax, merged, color="black", lw=1.8)
-    ax.set_title("5. Union of variants\n(removes start-point artifacts)")
+    draw(ax, final_smooth, color="black", lw=1.8)
+    ax.set_title("5. Final smoothing pass")
 
     ax = panels[5]
     reference(ax, original)
     gpd.GeoSeries([final]).plot(ax=ax, color="#d3eed3", alpha=0.8)
     draw(ax, final, color="#1a7a1a", lw=2.0)
     err = abs(final.area - original.area) / original.area
-    ax.set_title(f"6. Final smooth + restore area\n(area error {err:.4%})")
+    ax.set_title(f"6. Restore original area\n(area error {err:.4%})")
 
     minx, miny, maxx, maxy = original.buffer(1.4).bounds
     for ax in panels:
