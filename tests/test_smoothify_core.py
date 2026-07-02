@@ -1,5 +1,6 @@
 """Tests for core smoothify geometry functions."""
 
+import numpy as np
 import pytest
 from shapely.geometry import LineString, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -10,7 +11,9 @@ from smoothify.smoothify_core import (
     _join_adjacent,
     _preserve_area_brentq,
     _preserve_area_with_buffer,
+    _roll0,
     _rotate_polygon_start,
+    _rotate_ring_coords,
     _smoothify_geometry,
 )
 
@@ -27,6 +30,32 @@ class TestRotatePolygonStart:
         assert rotated.is_valid
         # Area should be identical
         assert abs(rotated.area - square.area) < 1e-10
+
+    def test_rotate_preserves_geometry(self):
+        """Rotation must yield the identical shape, only a different start.
+
+        The arc-length start vertex is interpolated on an existing edge, so it
+        is collinear and the ring is geometrically unchanged. Uses an irregular
+        polygon (asymmetric, uneven vertex spacing) so a placement bug would
+        actually move the boundary rather than hide behind symmetry."""
+        poly = Polygon([(0, 0), (30, 0), (30, 10), (18, 10), (18, 4), (0, 4)])
+        for shift in (0.1, 0.25, 0.5, 0.73, 0.9):
+            rotated = _rotate_polygon_start(poly, shift=shift)
+            assert rotated.is_valid
+            assert abs(rotated.area - poly.area) < 1e-9
+            # Same footprint: symmetric difference is (near) zero area.
+            assert poly.symmetric_difference(rotated).area < 1e-9
+
+    def test_rotate_start_at_arc_length(self):
+        """The new start sits at the requested arc-length fraction, not a vertex
+        index. On this 20x10 rectangle (perimeter 60) shift=0.25 is 15 units
+        along the first (length-20) edge, i.e. the interpolated point (15, 0) -
+        whereas index-based rotation would have jumped to the corner (20, 0)."""
+        rect = Polygon([(0, 0), (20, 0), (20, 10), (0, 10)])
+        coords = _rotate_ring_coords(rect.exterior, shift=0.25)
+        assert coords[0] == pytest.approx((15.0, 0.0))
+        # Ring stays closed.
+        assert coords[0] == pytest.approx(coords[-1])
 
 
 class TestGenerateStartingPointVariants:
@@ -304,3 +333,22 @@ class TestSmoothifyGeometry:
             _smoothify_geometry(
                 "not a geometry", segment_length=1.0, smooth_iterations=3
             )  # type: ignore
+
+
+class TestRoll0:
+    """_roll0 is a hot-path stand-in for np.roll(a, k, axis=0); it must match
+    it bit-for-bit for the shifts the pipeline uses (Chaikin's -1, and the
+    +/-k alignment shifts)."""
+
+    def test_matches_numpy_roll(self):
+        rng = np.random.default_rng(0)
+        for n in (1, 2, 5, 17, 240):
+            a = rng.standard_normal((n, 2))
+            for k in (-1, 0, 1, 3, -4, n, n + 2, -n - 1):
+                np.testing.assert_array_equal(_roll0(a, k), np.roll(a, k, axis=0))
+
+    def test_zero_shift_returns_same_object(self):
+        """k == 0 (mod n) should short-circuit without copying."""
+        a = np.arange(10, dtype=np.float64).reshape(5, 2)
+        assert _roll0(a, 0) is a
+        assert _roll0(a, 5) is a

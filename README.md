@@ -196,22 +196,21 @@ smoothed = smoothify(
 
 ## How It Works
 
-Smoothify uses an advanced multi-step smoothing pipeline:
+Smoothify uses an advanced multi-step smoothing pipeline. The numbered steps below correspond to the panels in the figure:
 
 <p align="left">
   <img src="https://raw.githubusercontent.com/DPIRD-DMA/Smoothify/main/images/pipeline_steps.png" alt="Smoothify pipeline steps" width="800">
 </p>
 
 
-1. Joins touching holes (for Polygons, when `merge_holes=True`) so they smooth as one opening
-2. Adds intermediate vertices along line segments (segmentize)
-3. Generates multiple rotated variants (for Polygons) to avoid artifacts
-4. Simplifies each variant to remove noise
-5. Applies Chaikin corner cutting to smooth
-6. Merges all variants via union to eliminate start-point artifacts
-7. Applies final smoothing pass
-8. Optionally restores original area via buffering (for Polygons)
-9. Detects and repairs any sharp folds left by features near the smoothing scale (e.g. one-pixel-wide arms), using a small morphological opening/closing bounded at `segment_length / 4`
+1. **Pixelated input** — a polygon straight from raster-to-vector conversion, with a stair-stepped boundary
+2. **Multiple variants** (for Polygons) that start at evenly spaced arc-length positions, each simplified to strip staircase noise, so no artifact is tied to a fixed start vertex
+3. **Chaikin corner cutting** applied to each variant
+4. **Per-point median merge** — a start-invariant consensus that resolves the variants' disagreements
+5. **Final smoothing pass** on the merged result
+6. **Restore original area** via buffering (for Polygons, when `preserve_area=True`)
+
+Two steps are not shown in the figure: before step 2, touching holes are joined (for Polygons, when `merge_holes=True`) so they smooth as one opening; and after step 6, the result is checked for sharp concave folds left by features near the smoothing scale (e.g. one-pixel-wide arms) and repaired with a small morphological opening/closing bounded at `segment_length / 4`.
 
 ## Invalid Geometries
 

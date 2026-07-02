@@ -23,6 +23,19 @@ from shapely.ops import unary_union
 _CHAIKIN_SEGMENT_FACTOR = 4
 
 
+def _roll0(a: "npt.NDArray[np.float64]", k: int) -> "npt.NDArray[np.float64]":
+    """Cyclically shift a 2D array along axis 0 (like ``np.roll(a, k, axis=0)``).
+
+    ``np.roll`` normalises axes and builds index arrays on every call; for the
+    tight per-variant loops here a direct concatenate of two slices is markedly
+    cheaper and bit-identical."""
+    n = len(a)
+    k %= n
+    if k == 0:
+        return a
+    return np.concatenate((a[n - k :], a[: n - k]), axis=0)
+
+
 def _chaikin_corner_cutting(
     geom: Polygon | LineString, num_iterations: int = 1, reverse: bool = False
 ) -> Polygon | LineString:
@@ -53,7 +66,7 @@ def _chaikin_corner_cutting(
         # Get point pairs for corner cutting
         if is_closed:
             p0 = points
-            p1 = np.roll(points, -1, axis=0)
+            p1 = _roll0(points, -1)
         else:
             p0 = points[:-1]
             p1 = points[1:]
@@ -114,23 +127,35 @@ def _max_concave_turn_degrees(geom: BaseGeometry) -> float:
 
 
 def _rotate_ring_coords(ring: LinearRing, shift: float) -> "npt.NDArray[np.float64]":
-    """Rotate a linear ring coordinate sequence by a fractional shift.
+    """Rotate a linear ring to start at a fractional arc-length position.
 
-    Used to create multiple starting point variants of a polygon for smoothing,
-    which are later merged to avoid artifacts from a fixed starting vertex."""
+    Used to create multiple starting-point variants of a polygon for smoothing,
+    which are later merged to avoid artifacts from a fixed starting vertex.
 
-    coords = np.array(ring.coords)
-    n = len(coords) - 1  # Exclude duplicate closing point
-    shift_idx = int(round(shift * n)) % n
-    # Use numpy array slicing and concatenation
-    rotated = np.vstack(
-        [
-            coords[shift_idx:],
-            coords[1 : shift_idx + 1],
-            coords[shift_idx : shift_idx + 1],
-        ]
-    )
-    return rotated
+    The start is placed ``shift`` of the way around the perimeter *by arc length*
+    (interpolating a single new vertex on the edge it lands on) rather than by
+    vertex index. Index-based rotation clusters the starts wherever vertices are
+    dense and skips long straight edges, which previously forced a full-ring
+    segmentize to even the spacing out -- every added vertex was collinear and
+    immediately stripped by the following Douglas-Peucker. Sampling by arc length
+    hits the same evenly spread positions while feeding DP only the original
+    vertices plus one, not the densified ring."""
+
+    coords = np.asarray(ring.coords, dtype=np.float64)
+    points = coords[:-1]  # drop duplicate closing point
+    n = len(points)
+    seg = np.sqrt((np.diff(np.vstack([points, points[:1]]), axis=0) ** 2).sum(axis=1))
+    cumulative = np.concatenate([[0.0], np.cumsum(seg)])
+    total = cumulative[-1]
+    if total <= 0:
+        return coords
+    target = (shift % 1.0) * total
+    j = int(np.searchsorted(cumulative, target, side="right") - 1)
+    j = min(max(j, 0), n - 1)
+    t = (target - cumulative[j]) / seg[j] if seg[j] > 0 else 0.0
+    start = points[j] + t * (points[(j + 1) % n] - points[j])
+    order = np.arange(j + 1, j + 1 + n) % n
+    return np.vstack([start, points[order], start])
 
 
 def _rotate_polygon_start(polygon: Polygon, shift: float) -> Polygon:
@@ -179,9 +204,10 @@ def _generate_starting_point_variants(
 
         return variants
     elif isinstance(geom, MultiPolygon):
-        # Invalid input is screened out before smoothing, so a valid Polygon
-        # should never become multi-part here. If it does, segmentize/simplify
-        # split it unexpectedly — surface that rather than a bare type error.
+        # Variants are generated from a single Polygon, so this branch should be
+        # unreachable. A MultiPolygon here means an invalid (e.g. self-
+        # intersecting) input slipped past screening — surface that explicitly
+        # rather than failing later with a bare type error.
         raise ValueError(
             "Preprocessing produced a MultiPolygon from a single Polygon "
             f"({len(geom.geoms)} parts); expected it to stay single-part. "
@@ -393,9 +419,10 @@ def _polygonal_only(geom: BaseGeometry) -> BaseGeometry:
     A rotated start-point variant can self-intersect after simplify + Chaikin
     where it rounds a neck only ~segment_length wide so the two sides cross.
     make_valid() then repairs it into a Polygon *plus* a zero-area line filament
-    at the pinch point. Those 1-D pieces carry no area, but unary_union keeps
-    them, so the variant union leaks through as a GeometryCollection (which the
-    rest of the pipeline can't handle). Drop them so the union stays polygonal.
+    at the pinch point, i.e. a GeometryCollection. Those 1-D pieces carry no
+    area, and the per-point median merge only reads Polygon/MultiPolygon parts,
+    so it would discard the whole variant. Drop the debris here so the variant
+    stays polygonal and contributes to the merge.
     """
     if isinstance(geom, GeometryCollection):
         polys = [g for g in geom.geoms if isinstance(g, (Polygon, MultiPolygon))]
@@ -405,11 +432,11 @@ def _polygonal_only(geom: BaseGeometry) -> BaseGeometry:
 
 # Bounds on the per-point resample count used when averaging variants. The count
 # scales with the variants' own detail (their max vertex count): too few points
-# coarsen a large, detailed ring and make the merged result diverge from the
-# per-vertex union, while the floor keeps the phase-alignment accurate on small
-# rings (below it, residual folds slip through). The cap bounds the FFT cost on
-# pathologically dense rings (some carry tens of thousands of vertices) at a
-# resolution well beyond what smoothing needs.
+# coarsen a large, detailed ring so the merged result loses fidelity, while the
+# floor keeps the phase-alignment accurate on small rings (below it, residual
+# folds slip through). The cap bounds the FFT cost on pathologically dense rings
+# (some carry tens of thousands of vertices) at a resolution well beyond what
+# smoothing needs.
 _MIN_RESAMPLE_POINTS = 240
 _MAX_RESAMPLE_POINTS = 4000
 
@@ -444,7 +471,7 @@ def _align_ring(
     sample_fft = np.fft.fft(s[:, 0] + 1j * s[:, 1])
     corr = np.fft.ifft(reference_fft * np.conj(sample_fft)).real
     k = int(np.argmax(corr))
-    candidates = (np.roll(sample, k, axis=0), np.roll(sample, -k, axis=0))
+    candidates = (_roll0(sample, k), _roll0(sample, -k))
     return min(candidates, key=lambda c: float(((c - reference) ** 2).sum()))
 
 
@@ -460,10 +487,10 @@ def _combine_variants(variants: list[BaseGeometry]) -> BaseGeometry:
     resampled to a common point count, brought into phase, and the coordinate-
     wise median is taken; ``make_valid`` cleans up any residual self-touch.
 
-    The median sits at the consensus interior rather than the union's outer
-    envelope, so the merged ring is slightly smaller than the union's was; area
-    preservation (when enabled) restores it, and when disabled the small
-    reduction is acceptable."""
+    The median sits at the consensus interior rather than the outer envelope a
+    union would trace, so the merged ring is slightly smaller; area preservation
+    (when enabled) restores it, and when disabled the small reduction is
+    acceptable."""
     rings: list[Polygon] = []
     for geom in variants:
         if isinstance(geom, MultiPolygon):
@@ -499,18 +526,19 @@ def _smoothify_geometry(
     """Core smoothing pipeline using Chaikin corner cutting with area preservation.
 
     This is the main smoothing algorithm that:
-    1. Adds intermediate vertices along line segments (segmentize)
-    2. Generates multiple rotated variants (for Polygons) to avoid artifacts
-    3. Simplifies each variant to remove noise, then re-segmentizes so no
+    1. Generates multiple variants (for Polygons) that start at evenly spaced
+       arc-length positions, to avoid artifacts tied to a fixed start vertex
+    2. Simplifies each variant to remove noise, then re-segmentizes so no
        segment exceeds segment_length * _CHAIKIN_SEGMENT_FACTOR (simplify
        strips collinear vertices, and Chaikin's corner cuts scale with
        segment length — unbounded segments would over-round sharp corners)
-    4. Applies Chaikin corner cutting to smooth
-    5. Merges the variants by a per-point median (a start-invariant consensus
+    3. Applies Chaikin corner cutting to smooth
+    4. Merges the variants by a per-point median (a start-invariant consensus
        that resolves start-point disagreements instead of superimposing them)
-    6. Simplifies the merged result and re-segmentizes again, then applies
+    5. Simplifies the merged result and re-segmentizes again, then applies
        a final smoothing pass
-    7. Optionally restores original area via buffering (for Polygons)"""
+    6. Optionally restores original area via buffering (for Polygons)
+    7. Seals any residual sharp concave fold (dilate-erode) and re-smooths"""
 
     if geom.geom_type == "Polygon":
         original_area = geom.area
@@ -519,20 +547,17 @@ def _smoothify_geometry(
     else:
         raise ValueError("Input geometry must be a Polygon or LineString.")
 
-    geom_segmented = geom.segmentize(segment_length / 2)
-
     geom_iterations = []
 
     if isinstance(geom, Polygon):
         starting_point_geoms = _generate_starting_point_variants(
-            geom_segmented, n_starting_points=4
+            geom, n_starting_points=4
         )
         for moved_start in starting_point_geoms:
-            # Simplify strips noise below segment_length, but on straight edges
-            # it also strips every densified vertex, leaving arbitrarily long
-            # segments. Chaikin cuts corners at 1/4 of each segment's length,
-            # so re-segmentize afterwards to cap the rounding at segment_length
-            # scale.
+            # Simplify strips noise below segment_length, leaving long segments
+            # on straight edges (collinear vertices are removed). Chaikin cuts
+            # corners at 1/4 of each segment's length, so re-segmentize afterwards
+            # to cap the rounding at segment_length scale.
             moved_start = moved_start.simplify(
                 tolerance=segment_length,
                 preserve_topology=True,
@@ -541,14 +566,14 @@ def _smoothify_geometry(
             # No reversed pass: on closed rings Chaikin is direction-invariant
             # (each edge {a, b} yields the same cut points 0.75a + 0.25b and
             # 0.25a + 0.75b either way), so a reversed variant duplicates the
-            # forward one bit-for-bit and only inflates the union below.
+            # forward one bit-for-bit and adds nothing to the merge below.
             #
-            # Cap pre-union iterations at 2: the merged result is simplified
+            # Cap pre-merge iterations at 2: the merged result is simplified
             # at segment_length / 5 below, which erases detail finer than
             # iteration 3+ adds (cuts beyond iteration 2 move the boundary by
             # less than that tolerance), while each extra iteration doubles
-            # the vertex count entering the expensive union. The final
-            # post-union pass still runs the full smooth_iterations.
+            # the vertex count entering the merge. The final post-merge pass
+            # still runs the full smooth_iterations.
             smoothed = _chaikin_corner_cutting(
                 geom=moved_start,
                 num_iterations=min(smooth_iterations, 2),
@@ -556,7 +581,7 @@ def _smoothify_geometry(
             geom_iterations.append(smoothed)
 
     else:
-        moved_start = geom_segmented.simplify(
+        moved_start = geom.simplify(
             tolerance=segment_length,
             preserve_topology=True,
         ).segmentize(segment_length * _CHAIKIN_SEGMENT_FACTOR)
@@ -569,7 +594,7 @@ def _smoothify_geometry(
 
     if isinstance(geom, Polygon):
         # A self-intersecting Chaikin variant repairs (via make_valid) into a
-        # polygon plus zero-area line debris; keep only the area so the union
+        # polygon plus zero-area line debris; keep only the area so the merge
         # below stays polygonal.
         geom_iterations = [_polygonal_only(make_valid(g)) for g in geom_iterations]
 
@@ -580,14 +605,15 @@ def _smoothify_geometry(
             preserve_topology=True,
         )
 
-        # If the union is a MultiPolygon, take the largest geometry
+        # If the merged result is a MultiPolygon, take the largest geometry
         if isinstance(dissolved_poly, MultiPolygon):
             largest_geom = max(dissolved_poly.geoms, key=lambda x: x.area)
             dissolved_poly = largest_geom
     else:
-        # LineStrings: skip make_valid/unary_union — self-intersecting lines
-        # are geometrically valid, and unary_union would split them at
-        # crossing points into a MultiLineString
+        # LineStrings: there is a single variant (no start rotation), so skip
+        # the make_valid + median-combine the polygon branch runs — a self-
+        # intersecting line is geometrically valid, and make_valid would split
+        # it at crossing points into a MultiLineString.
         dissolved_poly = geom_iterations[0].simplify(
             tolerance=segment_length / 5,
             preserve_topology=True,
@@ -627,19 +653,20 @@ def _smoothify_geometry(
 
     smoothed_geom = finish(smoothed_geom)
 
-    # Thin features fold in two ways that both surface as a sharp concave turn:
-    # variants disagree about an arm ~one segment_length wide and their union
-    # carries a forked slit, and — more severely — smoothing collapses such an
-    # arm (it can shed ~40% of its area), so the area-preservation buffer above
-    # has to expand it a long way and a large uniform outward buffer sharpens
-    # the inner corner where arms meet into a fold/cusp. A correctly smoothed
-    # result is gently curved on the concave side (thin arms may end in
-    # legitimate sharp convex hairpins), so on a sharp concave turn fill that
-    # notch with a small closing (dilate-erode), re-smooth, and restore area
-    # again. Seal the area-preserved result rather than the pre-buffer union:
-    # by now it already sits at target area, so this second area pass barely
-    # moves the boundary and cannot re-introduce the fold the way sealing the
-    # area-deficient union would once finish() buffered it back out.
+    # A thin feature can still fold into a sharp concave turn: smoothing
+    # collapses an arm ~one segment_length wide (it can shed ~40% of its area),
+    # so the area-preservation buffer above has to expand it a long way, and a
+    # large uniform outward buffer sharpens the inner corner where arms meet
+    # into a fold/cusp. (The median merge already resolves the other historical
+    # cause — variants disagreeing about such an arm and superimposing a forked
+    # slit.) A correctly smoothed result is gently curved on the concave side
+    # (thin arms may end in legitimate sharp convex hairpins), so on a sharp
+    # concave turn fill that notch with a small closing (dilate-erode),
+    # re-smooth, and restore area again. Seal the area-preserved result rather
+    # than the pre-buffer merged ring: by now it already sits at target area, so
+    # this second area pass barely moves the boundary and cannot re-introduce
+    # the fold the way sealing the area-deficient ring would once finish()
+    # buffered it back out.
     if (
         isinstance(smoothed_geom, Polygon)
         and _max_concave_turn_degrees(smoothed_geom) > 60
