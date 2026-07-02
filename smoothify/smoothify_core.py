@@ -403,6 +403,92 @@ def _polygonal_only(geom: BaseGeometry) -> BaseGeometry:
     return geom
 
 
+# Bounds on the per-point resample count used when averaging variants. The count
+# scales with the variants' own detail (their max vertex count): too few points
+# coarsen a large, detailed ring and make the merged result diverge from the
+# per-vertex union, while the floor keeps the phase-alignment accurate on small
+# rings (below it, residual folds slip through). The cap bounds the FFT cost on
+# pathologically dense rings (some carry tens of thousands of vertices) at a
+# resolution well beyond what smoothing needs.
+_MIN_RESAMPLE_POINTS = 240
+_MAX_RESAMPLE_POINTS = 4000
+
+
+def _resample_ring(polygon: Polygon, n_points: int) -> "npt.NDArray[np.float64]":
+    """Sample a polygon's exterior ring at ``n_points`` equally spaced by arc length."""
+    coords = np.asarray(polygon.exterior.coords, dtype=np.float64)
+    seg_len = np.sqrt((np.diff(coords, axis=0) ** 2).sum(axis=1))
+    cumulative = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total = cumulative[-1]
+    targets = np.linspace(0.0, total, n_points, endpoint=False)
+    x = np.interp(targets, cumulative, coords[:, 0])
+    y = np.interp(targets, cumulative, coords[:, 1])
+    return np.column_stack([x, y])
+
+
+def _align_ring(
+    sample: "npt.NDArray[np.float64]",
+    reference: "npt.NDArray[np.float64]",
+    reference_fft: "npt.NDArray[np.complex128]",
+) -> "npt.NDArray[np.float64]":
+    """Cyclically rotate ``sample`` so its points correspond to ``reference``.
+
+    The variants trace the same shape but start at different vertices, so before
+    averaging point-for-point they must be brought into phase. The best cyclic
+    shift maximises the cross-correlation, computed here in the complex plane
+    (``x + iy``) so a single FFT covers both coordinates; the real part of the
+    complex cross-correlation is exactly the summed x/y dot product. The
+    reference's transform is precomputed once by the caller. Both roll
+    directions are tried to stay agnostic to the FFT sign convention."""
+    s = sample - sample.mean(axis=0)
+    sample_fft = np.fft.fft(s[:, 0] + 1j * s[:, 1])
+    corr = np.fft.ifft(reference_fft * np.conj(sample_fft)).real
+    k = int(np.argmax(corr))
+    candidates = (np.roll(sample, k, axis=0), np.roll(sample, -k, axis=0))
+    return min(candidates, key=lambda c: float(((c - reference) ** 2).sum()))
+
+
+def _combine_variants(variants: list[BaseGeometry]) -> BaseGeometry:
+    """Merge the smoothed start-point variants by a per-point median.
+
+    Douglas-Peucker is start-vertex dependent, so the variants disagree on where
+    a feature's vertices land. Taking their geometric *union* superimposes those
+    disagreements (a single peak becomes two, with a valley that the later
+    area-preservation buffer sharpens into a fold). Averaging instead resolves
+    them to consensus, and the median (rather than the mean) outvotes a single
+    bad start-point variant rather than being dragged toward it. Each variant is
+    resampled to a common point count, brought into phase, and the coordinate-
+    wise median is taken; ``make_valid`` cleans up any residual self-touch.
+
+    The median sits at the consensus interior rather than the union's outer
+    envelope, so the merged ring is slightly smaller than the union's was; area
+    preservation (when enabled) restores it, and when disabled the small
+    reduction is acceptable."""
+    rings: list[Polygon] = []
+    for geom in variants:
+        if isinstance(geom, MultiPolygon):
+            geom = max(geom.geoms, key=lambda p: p.area)
+        if isinstance(geom, Polygon) and not geom.is_empty:
+            rings.append(geom)
+    if len(rings) < 2:
+        return rings[0] if rings else Polygon()
+
+    # Resample every variant to a shared point count so a per-point median is
+    # defined. Scale it to the variants' own detail (bounded) so large rings are
+    # not coarsened; see _MIN/_MAX_RESAMPLE_POINTS.
+    detail = max(len(r.exterior.coords) - 1 for r in rings)
+    n_points = int(np.clip(detail, _MIN_RESAMPLE_POINTS, _MAX_RESAMPLE_POINTS))
+    samples = [_resample_ring(r, n_points) for r in rings]
+    reference = samples[0]
+    centered = reference - reference.mean(axis=0)
+    reference_fft = np.fft.fft(centered[:, 0] + 1j * centered[:, 1])
+    aligned = [reference] + [
+        _align_ring(s, reference, reference_fft) for s in samples[1:]
+    ]
+    combined = np.median(np.array(aligned), axis=0)
+    return make_valid(Polygon(np.vstack([combined, combined[:1]])))
+
+
 def _smoothify_geometry(
     geom: Polygon | LineString,
     segment_length: float,
@@ -420,7 +506,8 @@ def _smoothify_geometry(
        strips collinear vertices, and Chaikin's corner cuts scale with
        segment length — unbounded segments would over-round sharp corners)
     4. Applies Chaikin corner cutting to smooth
-    5. Merges all variants via union to eliminate start-point artifacts
+    5. Merges the variants by a per-point median (a start-invariant consensus
+       that resolves start-point disagreements instead of superimposing them)
     6. Simplifies the merged result and re-segmentizes again, then applies
        a final smoothing pass
     7. Optionally restores original area via buffering (for Polygons)"""
@@ -486,7 +573,7 @@ def _smoothify_geometry(
         # below stays polygonal.
         geom_iterations = [_polygonal_only(make_valid(g)) for g in geom_iterations]
 
-        dissolved = make_valid(unary_union(geom_iterations))
+        dissolved = _combine_variants(geom_iterations)
 
         dissolved_poly = dissolved.simplify(
             tolerance=segment_length / 5,

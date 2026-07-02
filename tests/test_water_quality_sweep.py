@@ -49,10 +49,13 @@ CONFIGS = {
 # Sharpest concave turn tolerated anywhere in any output ring. Fold-class
 # artifacts (the bugs this guards against) measure 140-180 degrees.
 MAX_CONCAVE_TURN = 100.0
-# Net dataset area drift. Smoothing redistributes area locally; with
-# preserve_area each polygon is restored to ~0.01%, and merging/hole-joining
-# moves a little more by design.
+# Net dataset area drift. With preserve_area each polygon is restored to
+# ~0.01%, and merging/hole-joining moves a little more by design.
 MAX_TOTAL_AREA_DRIFT = 0.01
+# Without area preservation the dataset legitimately shrinks a few percent:
+# Chaikin cuts corners inward and the median variant-merge sits at the
+# consensus interior rather than the outer envelope. Only guard gross drift.
+MAX_TOTAL_AREA_DRIFT_NO_PRESERVE = 0.08
 
 
 @pytest.fixture(scope="module")
@@ -84,9 +87,12 @@ def test_water_outputs_are_clean(water_gdf, name):
     in_area = water_gdf.geometry.area.sum()
     out_area = result.geometry.area.sum()
     drift = abs(out_area - in_area) / in_area
-    assert drift < MAX_TOTAL_AREA_DRIFT, (
-        f"total area drifted {drift:.2%} (config {name!r})"
+    limit = (
+        MAX_TOTAL_AREA_DRIFT
+        if kwargs.get("preserve_area", True)
+        else MAX_TOTAL_AREA_DRIFT_NO_PRESERVE
     )
+    assert drift < limit, f"total area drifted {drift:.2%} (config {name!r})"
 
 
 @pytest.mark.slow
